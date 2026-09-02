@@ -1,0 +1,42 @@
+name: Probe save rename semantics
+
+# melonDS has no test suite and the four build workflows are build-only, so nothing
+# exercises runtime behaviour on any platform. The save file converter depends on
+# std::filesystem::rename replacing an existing destination silently, and on
+# symlink_status classifying every destination kind as occupied so it never gets the
+# chance to. This runs that check on each OS we build for.
+#
+# Not part of the .srm feature branch: this exists to answer "does the guard hold on
+# Windows and macOS", which reading the standard cannot settle.
+
+on:
+  push:
+    branches: [save-rename-probe]
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S tools/save-rename-probe -B probe-build
+
+      - name: Build
+        run: cmake --build probe-build --config Release
+
+      - name: Run probe
+        shell: bash
+        run: |
+          if [ -x probe-build/Release/probe.exe ]; then
+            ./probe-build/Release/probe.exe
+          elif [ -x probe-build/probe.exe ]; then
+            ./probe-build/probe.exe
+          else
+            ./probe-build/probe
+          fi
