@@ -1930,6 +1930,9 @@ void MainWindow::onUpdateAudioVolume(int vol, int dsisync)
 
 void MainWindow::onUpdateAudioSettings()
 {
+    // before the emuIsActive check: these are atomics and need no console
+    emuInstance->audioUpdateSpeedUpSettings();
+
     if (!emuThread->emuIsActive()) return;
     assert(emuInstance->nds != nullptr);
 

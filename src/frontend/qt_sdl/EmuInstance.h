@@ -21,6 +21,8 @@
 
 #include <SDL2/SDL.h>
 
+#include <atomic>
+
 #include "Platform.h"
 #include "main.h"
 #include "NDS.h"
@@ -28,8 +30,14 @@
 #include "Window.h"
 #include "Config.h"
 #include "SaveManager.h"
+#include "AudioLowPass.h"
+#include "AudioTimeStretch.h"
 
 const int kMaxWindows = 4;
+
+// Upper bound on frames drained from the SPU FIFO per callback, and the size of
+// the staging buffer that receives them.
+const int kAudioDrainMax = 2048;
 
 enum
 {
@@ -229,14 +237,17 @@ private:
     void updateFastForwardMute(bool fastForward);
     void audioSync();
     void audioUpdateSettings();
+    void audioUpdateSpeedUpSettings();
 
     void micOpen();
     void micClose();
     void micLoadWav(const std::string& name);
     void setupMicInputData();
 
-    int audioGetNumSamplesOut(int outlen);
     static void audioCallback(void* data, Uint8* stream, int len);
+    void audioDirectRead(melonDS::s16* stream, int len);
+    void audioStretchedRead(melonDS::s16* stream, int len);
+    void audioFinishBuffer(melonDS::s16* stream, int len, int num_in);
 
     int micGetNumSamplesIn(int inlen);
     void micResample(melonDS::s16* inbuf, int inlen);
@@ -316,7 +327,19 @@ private:
     SDL_AudioDeviceID audioDevice;
     int audioFreq;
     int audioBufSize;
-    float audioSampleFrac;
+    // Written from the Qt thread when the settings dialog is accepted, read on
+    // the audio thread. The emu thread is paused for that, but the audio device
+    // is not, so the callback really is running concurrently. The two enables
+    // are independent, so they need no ordering between them.
+    std::atomic<int> audioSpeedUpLowPass;
+    std::atomic<bool> audioTimeStretchEnable;
+    std::atomic<bool> audioLowPassEnable;
+    AudioLowPass audioLowPass;
+    AudioTimeStretch audioTimeStretch;
+    bool audioStretchEngaged;
+    melonDS::s16 audioStretchTemp[kAudioDrainMax * 2];
+    melonDS::u32 audioLastFrame;
+    double audioArrivalAvg;
     bool audioMutedToggle;
     bool audioMutedByFastForward;
     bool audioMutedByWindowFocus;

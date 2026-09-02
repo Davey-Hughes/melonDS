@@ -22,11 +22,11 @@
 #include "Platform.h"
 #include "main.h"
 
+#include "AudioSpeed.h"
+
 #include "mic_blow.h"
 
 using namespace melonDS;
-
-#define INTERNAL_FRAME_RATE 59.8260982880808f
 
 // --- AUDIO OUTPUT -----------------------------------------------------------
 
@@ -43,7 +43,12 @@ void EmuInstance::audioInit()
     audioSyncLock = SDL_CreateMutex();
 
     audioFreq = 48000; // TODO: make both of these configurable?
-    audioBufSize = 512;
+    // 256 rather than 512: the callback is what drains the SPU's 2048-frame
+    // output ring, so the period sets the ceiling on how fast the emulator can
+    // run before that ring overflows - 2047/256 is ~8x against ~4x at 512. It
+    // also halves output latency. The cost is less scheduling slack per
+    // callback, so a heavily loaded host glitches sooner.
+    audioBufSize = 256;
 
     SDL_AudioSpec whatIwant, whatIget;
     memset(&whatIwant, 0, sizeof(SDL_AudioSpec));
@@ -67,7 +72,14 @@ void EmuInstance::audioInit()
         SDL_PauseAudioDevice(audioDevice, 1);
     }
 
-    audioSampleFrac = 0;
+    audioSpeedUpLowPass.store(globalCfg.GetInt("SpeedUpLowPass"), std::memory_order_relaxed);
+    audioTimeStretchEnable.store(globalCfg.GetBool("SpeedUpTimeStretch"), std::memory_order_relaxed);
+    audioLowPassEnable.store(globalCfg.GetBool("SpeedUpLowPassEnable"), std::memory_order_relaxed);
+    audioLowPass.Init(audioFreq);
+    audioTimeStretch.Reset();
+    audioStretchEngaged = false;
+    audioLastFrame = 0;
+    audioArrivalAvg = 0.0;
 
     micStarted = false;
     micDevice = 0;
@@ -149,51 +161,125 @@ void EmuInstance::audioSync()
     }
 }
 
-int EmuInstance::audioGetNumSamplesOut(int outlen)
-{
-    float f_len_in = outlen * (curFPS/targetFPS);
-    f_len_in += audioSampleFrac;
-    int len_in = (int)floor(f_len_in);
-    audioSampleFrac = f_len_in - len_in;
-
-    return len_in;
-}
-
 void EmuInstance::audioCallback(void* data, Uint8* stream, int len)
 {
     EmuInstance* inst = (EmuInstance*)data;
     len /= (sizeof(s16) * 2);
 
-    double skew = std::max(inst->targetFPS / INTERNAL_FRAME_RATE, 0.5);
-    inst->nds->SPU.SetOutputSkew(skew);
+    // Pitch-correct regardless of speed; the stretcher fits the audio to the
+    // output. A skew derived from curFPS would resample and shift pitch.
+    inst->nds->SPU.SetOutputSkew(audioComputeOutputSkew(inst->targetFPS));
 
-    int len_in = inst->audioGetNumSamplesOut(len);
-    if (len_in > inst->audioBufSize) len_in = inst->audioBufSize;
+    bool offSpeed = inst->audioTimeStretchEnable.load(std::memory_order_relaxed)
+                    && audioIsOffSpeed(inst->curFPS, inst->targetFPS);
 
-    SDL_LockMutex(inst->audioSyncLock);
-    int num_in = inst->nds->SPU.ReadOutput((s16*) stream, len_in);
-    SDL_CondSignal(inst->audioSyncCond);
-    SDL_UnlockMutex(inst->audioSyncLock);
-
-    if ((num_in < 1) || inst->audioMutedByWindowFocus || inst->audioMutedToggle || inst->audioMutedByFastForward)
+    if (!offSpeed)
     {
-        memset(stream, 0, len*sizeof(s16)*2);
+        // Normal speed gets its own branch, so it cannot regress.
+        if (inst->audioStretchEngaged)
+        {
+            inst->audioTimeStretch.Reset();
+            inst->audioStretchEngaged = false;
+        }
+        inst->audioDirectRead((s16*) stream, len);
         return;
     }
 
-    if (inst->audioVolume < 256)
+    if (!inst->audioStretchEngaged)
     {
-        s16* samples = (s16*) stream;
-        for (int i = 0; i < num_in * 2; i++)
-            samples[i] = ((s32) samples[i] * inst->audioVolume) >> 8;
+        inst->audioStretchEngaged = true;
+        inst->audioArrivalAvg = len * audioSpeedRatio(inst->curFPS, inst->targetFPS);
+    }
+    inst->audioStretchedRead((s16*) stream, len);
+}
+
+void EmuInstance::audioDirectRead(s16* stream, int len)
+{
+    SDL_LockMutex(audioSyncLock);
+    int num_in = nds->SPU.ReadOutput(stream, len);
+    SDL_CondSignal(audioSyncCond);
+    SDL_UnlockMutex(audioSyncLock);
+
+    audioFinishBuffer(stream, len, num_in);
+}
+
+void EmuInstance::audioStretchedRead(s16* stream, int len)
+{
+    SDL_LockMutex(audioSyncLock);
+    int avail = nds->SPU.GetOutputSize();
+    if (avail > kAudioDrainMax) avail = kAudioDrainMax;
+    int got = (avail > 0) ? nds->SPU.ReadOutput(audioStretchTemp, avail) : 0;
+    SDL_CondSignal(audioSyncCond);
+    SDL_UnlockMutex(audioSyncLock);
+
+    if (got > 0)
+        audioTimeStretch.Write(audioStretchTemp, got);
+
+    // Arrival is lumpy - the emu thread delivers in bursts - so smooth it before
+    // using it as the rate.
+    audioArrivalAvg += (got - audioArrivalAvg) * 0.05;
+
+    double ratio = audioComputeStretchRatio(audioArrivalAvg, len,
+                                            audioTimeStretch.InputFill(),
+                                            AudioTimeStretch::kTargetInputFill);
+    int num_in = audioTimeStretch.Read(stream, len, ratio);
+
+    audioFinishBuffer(stream, len, num_in);
+}
+
+void EmuInstance::audioFinishBuffer(s16* stream, int len, int num_in)
+{
+    if (audioMutedByWindowFocus || audioMutedToggle || audioMutedByFastForward)
+    {
+        memset(stream, 0, len*sizeof(s16)*2);
+        audioLastFrame = 0;
+        return;
     }
 
-    if (num_in < len_in)
+    if (num_in < 1)
+    {
+        if (!audioStretchEngaged)
+        {
+            memset(stream, 0, len*sizeof(s16)*2);
+            audioLastFrame = 0;
+            return;
+        }
+
+        // Fade the last frame out across this buffer. Cutting straight to
+        // silence reads as a hard dropout, but holding it would sit on a DC
+        // offset for as long as the stall lasts.
+        s16 l = (s16)(audioLastFrame & 0xFFFF);
+        s16 r = (s16)(audioLastFrame >> 16);
+        for (int i = 0; i < len; i++)
+        {
+            int gain = ((len - i) << 8) / len;
+            stream[(i*2)+0] = (s16)(((s32)l * gain) >> 8);
+            stream[(i*2)+1] = (s16)(((s32)r * gain) >> 8);
+        }
+        audioLastFrame = 0;
+    }
+    else if (num_in < len)
     {
         int last = num_in-1;
 
-        for (int i = num_in; i < len_in; i++)
+        for (int i = num_in; i < len; i++)
             ((u32*)stream)[i] = ((u32*)stream)[last];
+    }
+
+    int lowPassRef = audioLowPassEnable.load(std::memory_order_relaxed)
+                     ? audioSpeedUpLowPass.load(std::memory_order_relaxed)
+                     : kSpeedUpLowPassOff;
+    double cutoff = audioComputeLowPassCutoff(curFPS, targetFPS, lowPassRef,
+                                              audioLowPass.WideOpenCutoff());
+    audioLowPass.Process((int16_t*) stream, len, cutoff, len / (double)audioFreq);
+
+    // Pre-volume, so the fade path above can be re-scaled consistently.
+    if (len > 0) audioLastFrame = ((u32*)stream)[len-1];
+
+    if (audioVolume < 256)
+    {
+        for (int i = 0; i < len * 2; i++)
+            stream[i] = ((s32) stream[i] * audioVolume) >> 8;
     }
 }
 
@@ -494,6 +580,15 @@ void EmuInstance::micCallback(void* data, Uint8* stream, int len)
 
 
 
+// atomics, so the audio settings dialog can apply these live with everything
+// running - which is what lets the cutoff be set by ear during fast-forward
+void EmuInstance::audioUpdateSpeedUpSettings()
+{
+    audioSpeedUpLowPass.store(globalCfg.GetInt("SpeedUpLowPass"), std::memory_order_relaxed);
+    audioTimeStretchEnable.store(globalCfg.GetBool("SpeedUpTimeStretch"), std::memory_order_relaxed);
+    audioLowPassEnable.store(globalCfg.GetBool("SpeedUpLowPassEnable"), std::memory_order_relaxed);
+}
+
 void EmuInstance::audioUpdateSettings()
 {
     if (micStarted) micClose();
@@ -504,12 +599,21 @@ void EmuInstance::audioUpdateSettings()
         nds->SPU.SetInterpolation(static_cast<AudioInterpolation>(audiointerp));
     }
 
+    audioUpdateSpeedUpSettings();
+
     setupMicInputData();
     if (micStarted) micOpen();
 }
 
 void EmuInstance::audioEnable()
 {
+    // Covers emulator reset and savestate load, which bracket with
+    // audioDisable/audioEnable - otherwise pre-reset audio splices into post.
+    audioTimeStretch.Reset();
+    audioStretchEngaged = false;
+    audioLastFrame = 0;
+    audioArrivalAvg = 0.0;
+
     if (audioDevice) SDL_PauseAudioDevice(audioDevice, 0);
     if (micStarted) micOpen();
 }
