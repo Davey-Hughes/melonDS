@@ -30,13 +30,16 @@
 #include "Window.h"
 #include "Config.h"
 #include "SaveManager.h"
+#include "AudioSpeed.h"
 #include "AudioLowPass.h"
 #include "AudioTimeStretch.h"
 
 const int kMaxWindows = 4;
 
-// Upper bound on frames drained from the SPU FIFO per callback, and the size of
-// the staging buffer that receives them.
+// upper bound on frames drained from the SPU FIFO per emulated frame, and the
+// size of the staging buffer that receives them. tied to kMinOutputSkew: at a
+// skew of 0.4 the SPU emits 802.3/0.4 ~= 2006 frames per emulated frame, so
+// lowering that floor means raising this too.
 const int kAudioDrainMax = 2048;
 
 enum
@@ -175,6 +178,15 @@ public:
     void micStop();
     int micReadInput(melonDS::s16* data, int maxlength);
 
+    // called from the emu thread every frame: it, not the audio callback,
+    // drains the SPU while off-speed
+    void audioDrainSPU();
+    bool audioOffSpeed() const;
+    // emu thread. call when the stream jumps - savestate load, undo
+    void audioMarkDiscontinuity();
+    // emu thread. the achieved frame rate, for the low-pass only
+    void audioSetMeasuredFPS(double fps);
+
     QMutex renderLock;
 
 private:
@@ -238,12 +250,15 @@ private:
     void audioSync();
     void audioUpdateSettings();
     void audioUpdateSpeedUpSettings();
+    void audioUpdateOutputSkew();
 
     void micOpen();
     void micClose();
     void micLoadWav(const std::string& name);
     void setupMicInputData();
 
+    int audioGetNumSamplesOut(int outlen);
+    double audioLowPassCutoff() const;
     static void audioCallback(void* data, Uint8* stream, int len);
     void audioDirectRead(melonDS::s16* stream, int len);
     void audioStretchedRead(melonDS::s16* stream, int len);
@@ -309,7 +324,8 @@ public:
     std::unique_ptr<SaveManager> firmwareSave;
 
     bool doLimitFPS;
-    double curFPS;
+    // the emu thread writes this, the audio thread reads it
+    std::atomic<double> curFPS;
     double targetFPS;
     double fastForwardFPS;
     double slowmoFPS;
@@ -327,19 +343,29 @@ private:
     SDL_AudioDeviceID audioDevice;
     int audioFreq;
     int audioBufSize;
-    // Written from the Qt thread when the settings dialog is accepted, read on
-    // the audio thread. The emu thread is paused for that, but the audio device
-    // is not, so the callback really is running concurrently. The two enables
-    // are independent, so they need no ordering between them.
-    std::atomic<int> audioSpeedUpLowPass;
-    std::atomic<bool> audioTimeStretchEnable;
-    std::atomic<bool> audioLowPassEnable;
+    // written from the Qt thread with the emu thread and the audio device
+    // paused, read on both while running. atomic so a slip in that pausing
+    // degrades to a stale read; they are independent and need no ordering.
+    std::atomic<int> audioSpeedUpLowPass{kSpeedUpLowPassOff};
+    std::atomic<bool> audioTimeStretchEnable{false};
+    std::atomic<bool> audioLowPassEnable{false};
+    // the rate actually achieved, published by the emu thread. curFPS is only
+    // the frame limiter's setpoint, and with an uncapped fast-forward target it
+    // is nowhere near the truth.
+    std::atomic<double> audioMeasuredFPS{0.0};
+    // frames handed to the stretcher, accepted or not. the audio thread derives
+    // the arrival rate from this: counting only accepted frames would read a
+    // saturated ring as silence and stretch the wrong way.
+    std::atomic<melonDS::s64> audioOfferedFrames{0};
     AudioLowPass audioLowPass;
     AudioTimeStretch audioTimeStretch;
     bool audioStretchEngaged;
-    melonDS::s16 audioStretchTemp[kAudioDrainMax * 2];
     melonDS::u32 audioLastFrame;
     double audioArrivalAvg;
+    melonDS::s64 audioLastOffered;
+    double audioSampleFrac;
+    melonDS::s16 audioDrainTemp[kAudioDrainMax * 2];
+    bool audioDrainEngaged;
     bool audioMutedToggle;
     bool audioMutedByFastForward;
     bool audioMutedByWindowFocus;

@@ -22,27 +22,24 @@
 #include <algorithm>
 #include <cmath>
 
-// The DS's true framerate; a skew of 1.0 emits at the hardware's rate.
+// the DS's true framerate; a skew of 1.0 emits at the hardware's rate
 constexpr double INTERNAL_FRAME_RATE = 59.8260982880808;
 
-// Setting value meaning "do not filter at all". An explicit sentinel: without
-// it a 24000 reference would still filter at 12 kHz at 2x.
+// sentinel value: don't filter at all
 constexpr int kSpeedUpLowPassOff = 24000;
 
-// Gain of the FIFO-fill correction on the stretch ratio.
 constexpr double kStretchTrimGain = 0.25;
 
-// Below 1 the stretcher expands (slow-mo), above it compresses (fast-forward).
-constexpr double kMinStretchRatio = 0.25;
+// below 1 the stretcher expands (slow-mo), above it compresses (fast-forward)
+constexpr double kMinStretchRatio = 1.0 / 32.0;
 constexpr double kMaxStretchRatio = 32.0;
 
-// Floor on what we hand blip_buf, and it is load-bearing rather than cosmetic.
-// SPU::BufferAudio flushes every 512*128 SPU cycles, which accumulates
-// 65536 * 48000 / (16756991 * skew) ~= 188/skew output samples, and blip_new(512)
-// asserts avail <= 512. Below ~0.37 that overflows the allocation.
+// SPU::BufferAudio flushes every 512*128 SPU cycles, accumulating
+// 65536*48000 / (16756991*skew) ~= 188/skew samples, and blip_new(512) asserts
+// avail <= 512. below ~0.37 that overflows the allocation.
 constexpr double kMinOutputSkew = 0.4;
 
-// Emulated speed relative to normal.
+// emulated speed relative to normal
 inline double audioSpeedRatio(double curFPS, double targetFPS)
 {
     if (targetFPS <= 0.0) return 1.0;
@@ -54,23 +51,16 @@ inline bool audioIsOffSpeed(double curFPS, double targetFPS)
     return std::fabs(curFPS - targetFPS) > 0.01;
 }
 
-// Deliberately independent of emulation speed: off-speed audio just arrives
-// faster or slower, and fitting it to the output is the stretcher's job.
-// Deriving this from curFPS instead would resample, shifting pitch.
+// independent of emulation speed: deriving this from curFPS would resample,
+// shifting pitch. fitting off-speed audio to the output is the stretcher's job.
 inline double audioComputeOutputSkew(double targetFPS)
 {
     return std::max(targetFPS / INTERNAL_FRAME_RATE, kMinOutputSkew);
 }
 
-// How much input each output frame consumes.
-//
-// Driven by measured arrival rather than the requested speed. The SPU FIFO is
-// polled once per callback and holds 2048 frames, so supply is capped near 4x
-// however fast the emulator runs; asking for the requested ratio above that
-// starves the stretcher, and the trim has nowhere near the authority to close
-// a gap that large. In steady state consumption must equal arrival, so that is
-// the ratio. The FIFO-fill term only steers the level: a larger ratio drains
-// faster, so a full FIFO must raise it.
+// how much input each output frame consumes. driven by measured arrival rather
+// than the requested speed, which the host may not achieve. the FIFO-fill term
+// only steers the level: a larger ratio drains faster.
 inline double audioComputeStretchRatio(double arrivalPerCallback, int outputPerCallback,
                                        int inputFill, int targetFill)
 {
@@ -88,8 +78,8 @@ inline double audioComputeStretchRatio(double arrivalPerCallback, int outputPerC
     return std::clamp(ratio, kMinStretchRatio, kMaxStretchRatio);
 }
 
-// Cutoff for the low-pass, in Hz. wideOpen means transparent; the filter only
-// engages above normal speed, and gets duller the faster the emulator runs.
+// low-pass cutoff in Hz. wideOpen means transparent; the filter only engages
+// above normal speed, and gets duller the faster the emulator runs.
 inline double audioComputeLowPassCutoff(double curFPS, double targetFPS,
                                         int reference, double wideOpen)
 {

@@ -23,20 +23,16 @@
 #include <cmath>
 #include <cstdint>
 
-// Fourth-order Butterworth low-pass: two cascaded RBJ biquads, stereo with
-// independent state per channel. The cutoff is smoothed rather than jumped, so
-// engaging fast-forward slides the filter shut instead of stepping the
-// coefficients, which would click. At wide open the output is left untouched.
+// fourth-order Butterworth low-pass: two cascaded RBJ biquads, stereo with
+// independent state per channel. the cutoff is smoothed rather than jumped,
+// since stepping the coefficients would click. wide open leaves the output alone.
 class AudioLowPass
 {
 public:
-    // Time constant of the cutoff smoother, in seconds.
-    static constexpr double kSmoothingTau = 0.05;
-    // Fraction of wide-open at which the filter stops touching the output.
-    static constexpr double kBypassThreshold = 0.995;
-    // Section Q's for a fourth-order Butterworth cascade.
+    static constexpr double kSmoothingTau = 0.05;      // cutoff smoother, seconds
+    static constexpr double kBypassThreshold = 0.995;  // fraction of wide-open
+    // section Q's for a fourth-order Butterworth cascade
     static constexpr double kSectionQ[2] = {0.54119610014619698, 1.3065629648763766};
-    // Lowest cutoff the coefficient design will accept.
     static constexpr double kMinCutoff = 20.0;
 
     void Init(double sampleRate)
@@ -55,7 +51,7 @@ public:
     double Cutoff() const { return CurCutoff; }
     bool Bypassed() const { return CurCutoff >= (WideOpen * kBypassThreshold); }
 
-    // Advance the smoothed cutoff by one block, then filter in place.
+    // advance the smoothed cutoff by one block, then filter in place
     void Process(int16_t* samples, int numFrames, double targetHz, double blockSeconds)
     {
         Smooth(targetHz, blockSeconds);
@@ -65,12 +61,23 @@ public:
         {
             for (int ch = 0; ch < 2; ch++)
             {
-                // Runs even when bypassed: its state must stay in step with
-                // the signal, or re-engaging would click.
+                // runs even when bypassed: the state must stay in step with
+                // the signal, or re-engaging would click
                 double y = ProcessSample(samples[(i*2)+ch], ch);
                 if (!bypass) samples[(i*2)+ch] = Saturate(y);
             }
         }
+    }
+
+    // advance the cutoff and the filter state over silence, writing nothing.
+    // used while muted, so unmuting neither steps the coefficients nor dumps
+    // whatever was still ringing in the biquads into a buffer meant to be quiet.
+    void ProcessMuted(int numFrames, double targetHz, double blockSeconds)
+    {
+        Smooth(targetHz, blockSeconds);
+        for (int i = 0; i < numFrames; i++)
+            for (int ch = 0; ch < 2; ch++)
+                ProcessSample(0.0, ch);
     }
 
     void Smooth(double targetHz, double blockSeconds)

@@ -376,6 +376,8 @@ void EmuThread::run()
                 emuInstance->audioVolume = volumeLevel * (256.0 / 31.0);
             }
 
+            emuInstance->audioDrainSPU();
+
             if (emuInstance->doAudioSync && !(fastforward || slowmo))
                 emuInstance->audioSync();
 
@@ -412,6 +414,7 @@ void EmuThread::run()
                 lastMeasureTime = time;
 
                 u32 fps = round(nframes / dt);
+                if (dt > 0.0) emuInstance->audioSetMeasuredFPS(nframes / dt);
                 nframes = 0;
 
                 float fpstarget = 1.0/frametimeStep;
@@ -428,6 +431,7 @@ void EmuThread::run()
         else
         {
             // paused
+            emuInstance->audioSetMeasuredFPS(0.0);
             nframes = 0;
             lastTime = SDL_GetPerformanceCounter() * perfCountsSec;
             lastMeasureTime = lastTime;
@@ -622,10 +626,12 @@ void EmuThread::handleMessages()
 
         case msg_LoadState:
             msgResult = emuInstance->loadState(msg.param.value<QString>().toStdString());
+            emuInstance->audioMarkDiscontinuity();
             break;
 
         case msg_UndoStateLoad:
             emuInstance->undoStateLoad();
+            emuInstance->audioMarkDiscontinuity();
             msgResult = 1;
             break;
 

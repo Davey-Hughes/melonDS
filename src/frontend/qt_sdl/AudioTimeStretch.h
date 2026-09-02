@@ -20,24 +20,18 @@
 #define AUDIOTIMESTRETCH_H
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 
 // WSOLA time-stretcher: changes playback rate while preserving pitch, by
-// overlap-adding windowed frames picked for waveform similarity so consecutive
+// overlap-adding windowed frames picked for waveform similarity, so consecutive
 // frames splice on matching phase.
 //
-// kFrameSize and kSearchRadius are tuned, not guessed. The artifact they trade
-// against is amplitude pumping at the synthesis hop rate on noisy material,
-// measured at ratio 3 with the search on versus forced off:
-//
-//   frame 1024   0.139 on / 0.180 off    search buys 1.3x
-//   frame  512   0.071 on / 0.175 off    search buys 2.5x
-//   frame  256   0.036 on / 0.169 off    search buys 4.7x
-//
-// Shorter frames let the search find better matches; off, the figure is flat.
-// Below 256 the window holds barely one cycle of a bass note, so this stops.
+// single producer/single consumer. the emu thread calls Write and BeginSession;
+// the audio thread calls Read, InputFill, OutputFill and TotalWritten. Reset is
+// neither, and needs both stopped.
 class AudioTimeStretch
 {
 public:
@@ -49,9 +43,23 @@ public:
     static constexpr int kInputCapacity = 32768;          // must be a power of two
     static constexpr int kOutputCapacity = 8192;          // must be a power of two
 
-    // Input the ratio control aims to keep buffered. Absolute, not a multiple
-    // of the window: it absorbs lumpy arrival from the emu thread.
-    static constexpr int kTargetInputFill = 4096;
+    // floor on how much input the ratio control keeps buffered
+    static constexpr int kMinTargetInputFill = 4096;
+
+    // how much input to keep buffered. a fixed figure starves the stretcher at
+    // high speed, where one callback consumes more than the target.
+    static int TargetInputFill(double arrivalPerCallback)
+    {
+        // leave half the ring free, or a large hop squeezes Write down to nothing
+        const double cap = kInputCapacity / 2;
+
+        double need = (2.0 * arrivalPerCallback) + kSearchRadius + kFrameSize;
+        // clamped as a double: a TargetFPS of 0.0001 seeds an arrival estimate
+        // around 2.5e9, and casting that to int is UB
+        if (!(need > kMinTargetInputFill)) need = kMinTargetInputFill;
+        if (need > cap) need = cap;
+        return (int)need;
+    }
 
     AudioTimeStretch()
     {
@@ -60,9 +68,14 @@ public:
         Reset();
     }
 
+    // not thread-safe: call only with both sides stopped
     void Reset()
     {
-        WritePos = 0;
+        WritePos.store(0, std::memory_order_relaxed);
+        Generation.store(0, std::memory_order_relaxed);
+        ConsumerFloor.store(0, std::memory_order_relaxed);
+        SeenWrite = 0;
+        SeenGeneration = 0;
         AnalysisPos = 0;
         NaturalPos = 0;
         OutReadPos = 0;
@@ -71,8 +84,8 @@ public:
         std::memset(AccL, 0, sizeof(AccL));
         std::memset(AccR, 0, sizeof(AccR));
 
-        // Belt and braces: the search is already bounded to written frames, but
-        // this makes any future bound slip degrade to silence rather than noise.
+        // the search is already bounded to written frames; this only degrades
+        // a future bound slip to silence rather than noise
         std::memset(InL, 0, sizeof(InL));
         std::memset(InR, 0, sizeof(InR));
         std::memset(InMono, 0, sizeof(InMono));
@@ -80,7 +93,7 @@ public:
 
     int InputFill() const
     {
-        int64_t pending = WritePos - AnalysisPos;
+        int64_t pending = WritePos.load(std::memory_order_acquire) - AnalysisPos;
         if (pending < 0) return 0;
         if (pending > kInputCapacity) return kInputCapacity;
         return (int)pending;
@@ -88,23 +101,60 @@ public:
 
     int OutputFill() const { return (int)(OutWritePos - OutReadPos); }
 
-    // Append interleaved stereo frames.
+    // append interleaved stereo frames, returning how many were accepted.
+    // writing is refused rather than allowed to lap the consumer.
     int Write(const int16_t* samples, int numFrames)
     {
+        int64_t w = WritePos.load(std::memory_order_relaxed);
+
+        int64_t floor = ConsumerFloor.load(std::memory_order_acquire);
+        int64_t space = kInputCapacity - (w - floor);
+        if (space < 0) space = 0;
+        if (numFrames > space) numFrames = (int)space;
+        if (numFrames <= 0) return 0;
+
         for (int i = 0; i < numFrames; i++)
         {
-            int idx = (int)(WritePos & (kInputCapacity - 1));
+            int idx = (int)((w + i) & (kInputCapacity - 1));
             int16_t l = samples[(i*2)+0];
             int16_t r = samples[(i*2)+1];
             InL[idx] = l;
             InR[idx] = r;
             InMono[idx] = 0.5f * ((float)l + (float)r);
-            WritePos++;
         }
 
-        // Producer outran us and overwrote frames we still wanted: skip forward
-        // rather than read whatever landed on top of them.
-        int64_t floor = (WritePos - kInputCapacity) + kSearchRadius + kFrameSize;
+        // release: the frames must be visible before the count advertising them
+        WritePos.store(w + numFrames, std::memory_order_release);
+        return numFrames;
+    }
+
+    // marks a discontinuity: the consumer resyncs rather than splicing across it
+    void BeginSession()
+    {
+        Generation.fetch_add(1, std::memory_order_release);
+    }
+
+    int64_t TotalWritten() const { return WritePos.load(std::memory_order_acquire); }
+
+    // emit up to numFrames of interleaved stereo, synthesising as needed. works
+    // off one snapshot of the producer's count, so the bounds can't shift.
+    int Read(int16_t* samples, int numFrames, double ratio)
+    {
+        // generation first, then WritePos. the other order lets a session that
+        // starts between the two loads resync against a stale SeenWrite, and
+        // then never resync again.
+        uint32_t gen = Generation.load(std::memory_order_acquire);
+        SeenWrite = WritePos.load(std::memory_order_acquire);
+
+        if (gen != SeenGeneration)
+        {
+            SeenGeneration = gen;
+            ResyncToLive();
+        }
+
+        // the producer outran us: skip forward rather than read what landed
+        // on top of the frames we wanted
+        int64_t floor = (SeenWrite - kInputCapacity) + kSearchRadius + kFrameSize;
         if (AnalysisPos < floor)
         {
             AnalysisPos = floor;
@@ -112,12 +162,6 @@ public:
             Primed = false;
         }
 
-        return numFrames;
-    }
-
-    // Emit up to numFrames of interleaved stereo, synthesising as needed.
-    int Read(int16_t* samples, int numFrames, double ratio)
-    {
         while ((OutputFill() < numFrames) && CanSynthesise())
             SynthesiseHop(ratio);
 
@@ -129,6 +173,8 @@ public:
             samples[(i*2)+1] = OutR[idx];
             OutReadPos++;
         }
+
+        PublishFloor();
         return n;
     }
 
@@ -141,16 +187,39 @@ private:
         return (int16_t)s;
     }
 
+    // publish the oldest frame we might still look at, so the producer stops
+    // short of it. NaturalPos can sit well below AnalysisPos - kSearchRadius.
+    void PublishFloor()
+    {
+        int64_t floorNow = std::min(AnalysisPos - kSearchRadius, NaturalPos);
+        if (floorNow < 0) floorNow = 0;
+        ConsumerFloor.store(floorNow, std::memory_order_release);
+    }
+
+    // drop whatever is stale and pick up at live data. the published floor can
+    // decrease here, but the dip is bounded by kFrameSize + kSearchRadius, far
+    // short of kInputCapacity, so the producer can't reach the re-exposed region.
+    void ResyncToLive()
+    {
+        AnalysisPos = std::max<int64_t>(0, SeenWrite - kFrameSize);
+        NaturalPos = AnalysisPos;
+        Primed = false;
+        PublishFloor();
+        OutReadPos = 0;
+        OutWritePos = 0;
+        std::memset(AccL, 0, sizeof(AccL));
+        std::memset(AccR, 0, sizeof(AccR));
+    }
+
     bool CanSynthesise() const
     {
         if ((kOutputCapacity - OutputFill()) < kSynthesisHop) return false;
 
-        // Only the frame itself and the natural-continuation reference need to
-        // be present; the search clamps to whatever else is available. Demanding
-        // the full radius here would emit no output at all on a short FIFO.
+        // only the frame and the natural-continuation reference need to be
+        // present; demanding the full search radius would starve a short FIFO
         int64_t frameEnd = AnalysisPos + kFrameSize;
         int64_t naturalEnd = NaturalPos + kSynthesisHop;
-        return (WritePos >= frameEnd) && (WritePos >= naturalEnd);
+        return (SeenWrite >= frameEnd) && (SeenWrite >= naturalEnd);
     }
 
     void SynthesiseHop(double ratio)
@@ -182,42 +251,41 @@ private:
         std::memset(AccL + kSynthesisHop, 0, kSynthesisHop * sizeof(float));
         std::memset(AccR + kSynthesisHop, 0, kSynthesisHop * sizeof(float));
 
-        // The nominal pointer advances by hop alone; the search only picks which
-        // frame to window. Advancing from chosen instead would make consumption
-        // hop + E[bestK], which the caller's ratio control cannot see.
+        // the nominal pointer advances by hop alone; advancing from chosen would
+        // make consumption hop + E[bestK], which the ratio control can't see
         NaturalPos = chosen + kSynthesisHop;
         AnalysisPos += hop;
     }
 
     int64_t FindBestOffset() const
     {
-        int64_t oldest = std::max<int64_t>(0, WritePos - kInputCapacity);
+        int64_t oldest = std::max<int64_t>(0, SeenWrite - kInputCapacity);
 
-        // NaturalPos trails AnalysisPos by up to hop + kSearchRadius - kSynthesisHop,
-        // which at a high ratio on a near-full ring can fall off the back. The
-        // reference would then be overwritten frames, so search nothing instead.
+        // at a high ratio on a near-full ring NaturalPos can fall off the back.
+        // the reference would then be overwritten frames, so don't search.
         if (NaturalPos < oldest) return AnalysisPos;
 
         double refEnergy = Energy(NaturalPos);
 
-        // Full radius regardless of hop: expansion needs the reach, since the
-        // natural continuation sits |kSynthesisHop - hop| ahead of the nominal.
+        // full radius regardless of hop: expansion needs the reach
         const int radius = kSearchRadius;
 
-        // Masking a negative position wraps it into frames we never wrote.
+        // masking a negative position wraps it into frames we never wrote
         int lowestK = -radius;
         if ((AnalysisPos + lowestK) < oldest)
             lowestK = (int)(oldest - AnalysisPos);
 
-        // Clamp to what has arrived, so a short FIFO narrows the search.
+        // clamp to what has arrived, so a short FIFO narrows the search
         int highestK = radius;
-        int64_t latest = WritePos - kFrameSize;
+        int64_t latest = SeenWrite - kFrameSize;
         if ((AnalysisPos + highestK) > latest)
             highestK = (int)(latest - AnalysisPos);
         if (highestK < lowestK) highestK = lowestK;
 
+        // seeded from the nominal offset, so ties keep it rather than sliding
+        // to the bottom of the window (every score is 0 on digital silence)
         int bestK = std::min(std::max(lowestK, 0), highestK);
-        double bestScore = -1.0e30;
+        double bestScore = Score(AnalysisPos + bestK, refEnergy);
 
         for (int k = lowestK; k <= highestK; k += kCoarseStride)
         {
@@ -247,7 +315,7 @@ private:
         return e;
     }
 
-    // Normalised so the search doesn't just latch onto the loudest candidate.
+    // normalised, so the search doesn't just latch onto the loudest candidate
     double Score(int64_t pos, double refEnergy) const
     {
         double dot = 0.0;
@@ -267,7 +335,12 @@ private:
     int16_t InL[kInputCapacity];
     int16_t InR[kInputCapacity];
     float InMono[kInputCapacity];
-    int64_t WritePos = 0;
+    std::atomic<int64_t> WritePos{0};      // producer writes, consumer reads
+    std::atomic<uint32_t> Generation{0};   // producer writes, consumer reads
+    std::atomic<int64_t> ConsumerFloor{0}; // consumer writes, producer reads
+
+    int64_t SeenWrite = 0;                 // consumer's snapshot of WritePos
+    uint32_t SeenGeneration = 0;
     int64_t AnalysisPos = 0;
     int64_t NaturalPos = 0;
     bool Primed = false;
