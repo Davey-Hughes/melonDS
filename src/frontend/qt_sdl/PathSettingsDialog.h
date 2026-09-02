@@ -63,6 +63,8 @@ private slots:
     void on_btnCheatFileBrowse_clicked();
 
 private:
+    bool confirmSaveOverwrite(const QString& dir, const QString& ext);
+
     Ui::PathSettingsDialog* ui;
     EmuInstance* emuInstance;
 };

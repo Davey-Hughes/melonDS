@@ -17,9 +17,13 @@
 */
 
 #include <stdio.h>
+#include <QComboBox>
+#include <QDesktopServices>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QMessageBox>
 #include <QTemporaryFile>
+#include <QUrl>
 
 #include "types.h"
 #include "Config.h"
@@ -50,6 +54,11 @@ PathSettingsDialog::PathSettingsDialog(QWidget* parent) : QDialog(parent), ui(ne
     ui->txtSavestatePath->setText(cfg.GetQString("SavestatePath"));
     ui->txtCheatFilePath->setText(cfg.GetQString("CheatFilePath"));
 
+    ui->cbxSaveFileExtension->addItem(".sav");
+    ui->cbxSaveFileExtension->addItem(".srm");
+    int extidx = ui->cbxSaveFileExtension->findText(cfg.GetQString("SaveFileExtension"));
+    ui->cbxSaveFileExtension->setCurrentIndex(extidx < 0 ? 0 : extidx);
+
     int inst = emuInstance->getInstanceID();
     if (inst > 0)
         ui->lblInstanceNum->setText(QString("Configuring paths for instance %1").arg(inst+1));
@@ -61,6 +70,7 @@ PathSettingsDialog::PathSettingsDialog(QWidget* parent) : QDialog(parent), ui(ne
         w->setProperty("user_originalValue", w->val());
 
     SET_ORIGVAL(QLineEdit, text);
+    SET_ORIGVAL(QComboBox, currentIndex);
 
 #undef SET_ORIGVAL
 }
@@ -97,6 +107,7 @@ void PathSettingsDialog::done(int r)
         }
 
         CHECK_ORIGVAL(QLineEdit, text);
+        CHECK_ORIGVAL(QComboBox, currentIndex);
 
 #undef CHECK_ORIGVAL
 
@@ -108,10 +119,15 @@ void PathSettingsDialog::done(int r)
                     QMessageBox::Ok, QMessageBox::Cancel) != QMessageBox::Ok)
                 return;
 
+            if (!confirmSaveOverwrite(ui->txtSaveFilePath->text(),
+                                      ui->cbxSaveFileExtension->currentText()))
+                return;
+
             auto& cfg = emuInstance->getLocalConfig();
             cfg.SetQString("SaveFilePath", ui->txtSaveFilePath->text());
             cfg.SetQString("SavestatePath", ui->txtSavestatePath->text());
             cfg.SetQString("CheatFilePath", ui->txtCheatFilePath->text());
+            cfg.SetQString("SaveFileExtension", ui->cbxSaveFileExtension->currentText());
 
             Config::Save();
 
@@ -173,4 +189,24 @@ void PathSettingsDialog::on_btnCheatFileBrowse_clicked()
     }
 
     ui->txtCheatFilePath->setText(dir);
+}
+
+// Retargeting a live SaveManager flushes the in-memory save to the new path, which
+// truncates whatever is there. Name the file rather than let it vanish silently.
+bool PathSettingsDialog::confirmSaveOverwrite(const QString& dir, const QString& ext)
+{
+    if (!emuInstance->emuIsActive()) return true;
+
+    std::string victim = emuInstance->saveOverwrittenBySettings(dir.toStdString(),
+                                                                ext.toStdString());
+    if (victim.empty()) return true;
+
+    QString msg = QString("%1 already exists and will be overwritten with the save "
+                          "data currently in memory. Its contents will be lost.\n\n"
+                          "Continue?")
+                  .arg(QFileInfo(QString::fromStdString(victim)).fileName());
+
+    return QMessageBox::warning(this, "melonDS", msg,
+                                QMessageBox::Yes|QMessageBox::No,
+                                QMessageBox::No) == QMessageBox::Yes;
 }
