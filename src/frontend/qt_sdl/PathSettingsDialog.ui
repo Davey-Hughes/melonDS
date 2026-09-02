@@ -118,8 +118,39 @@
      </property>
     </widget>
    </item>
-   <item row="2" column="1">
-    <widget class="QComboBox" name="cbxSaveFileExtension"/>
+   <item row="2" column="1" colspan="2">
+    <layout class="QHBoxLayout" name="layoutSaveFileExtension">
+     <item>
+      <widget class="QComboBox" name="cbxSaveFileExtension"/>
+     </item>
+     <item>
+      <spacer name="spacerSaveFileExtension">
+       <property name="orientation">
+        <enum>Qt::Horizontal</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>40</width>
+         <height>20</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+     <item>
+      <widget class="QPushButton" name="btnConvertSaves">
+       <property name="text">
+        <string>Convert...</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="btnOpenSaveDir">
+       <property name="text">
+        <string>Open folder</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
    </item>
    <item row="0" column="0" colspan="3">
     <widget class="QLabel" name="lblInstanceNum">
@@ -134,6 +165,8 @@
   <tabstop>txtSaveFilePath</tabstop>
   <tabstop>btnSaveFileBrowse</tabstop>
   <tabstop>cbxSaveFileExtension</tabstop>
+  <tabstop>btnConvertSaves</tabstop>
+  <tabstop>btnOpenSaveDir</tabstop>
   <tabstop>txtSavestatePath</tabstop>
   <tabstop>btnSavestateBrowse</tabstop>
   <tabstop>txtCheatFilePath</tabstop>

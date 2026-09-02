@@ -31,6 +31,7 @@
 #include "main.h"
 
 #include "PathSettingsDialog.h"
+#include "SaveConversionDialog.h"
 #include "ui_PathSettingsDialog.h"
 
 using namespace melonDS::Platform;
@@ -89,7 +90,8 @@ void PathSettingsDialog::done(int r)
         return;
     }
     
-    needsReset = false;
+    // a conversion moved files, so re-resolve even if this is a cancel
+    needsReset = savesConverted;
 
     if (r == QDialog::Accepted)
     {
@@ -209,4 +211,69 @@ bool PathSettingsDialog::confirmSaveOverwrite(const QString& dir, const QString&
     return QMessageBox::warning(this, "melonDS", msg,
                                 QMessageBox::Yes|QMessageBox::No,
                                 QMessageBox::No) == QMessageBox::Yes;
+}
+
+void PathSettingsDialog::on_btnOpenSaveDir_clicked()
+{
+    QString dir = ui->txtSaveFilePath->text();
+    if (dir.isEmpty())
+    {
+        QMessageBox::information(this, "melonDS",
+            "There is no save files path set.\n\nWith a blank path, saves are kept next "
+            "to each ROM rather than in one directory.");
+        return;
+    }
+
+    if (!QFileInfo(dir).isDir())
+    {
+        QMessageBox::warning(this, "melonDS", "That save files path does not exist.");
+        return;
+    }
+
+    QDesktopServices::openUrl(QUrl::fromLocalFile(dir));
+}
+
+void PathSettingsDialog::on_btnConvertSaves_clicked()
+{
+    QString dir = ui->txtSaveFilePath->text();
+    if (dir.isEmpty())
+    {
+        QMessageBox::information(this, "melonDS",
+            "Set a save files path first.\n\nWith a blank path, saves are kept next to "
+            "each ROM rather than in one directory, so there is no single place to convert.");
+        return;
+    }
+
+    if (!QFileInfo(dir).isDir())
+    {
+        QMessageBox::warning(this, "melonDS", "That save files path does not exist.");
+        return;
+    }
+
+    // both from the combobox, so an unrecognised stored value can't build a target
+    int idx = ui->cbxSaveFileExtension->currentIndex();
+    QString toext = ui->cbxSaveFileExtension->itemText(idx);
+    QString fromext = ui->cbxSaveFileExtension->itemText(idx == 0 ? 1 : 0);
+
+    // asked before anything is renamed, since renaming cannot be undone
+    if (!confirmSaveOverwrite(dir, toext))
+        return;
+
+    SaveConversionDialog dlg(this, dir, fromext, toext, emuInstance->emuIsActive());
+    dlg.exec();
+
+    if (dlg.renamedCount() > 0)
+    {
+        // the rename cannot be undone, so the setting has to be saved with it or
+        // Cancel would leave the config and the files on different extensions
+        auto& cfg = emuInstance->getLocalConfig();
+        cfg.SetQString("SaveFilePath", dir);
+        cfg.SetQString("SaveFileExtension", toext);
+        Config::Save();
+
+        ui->txtSaveFilePath->setProperty("user_originalValue", dir);
+        ui->cbxSaveFileExtension->setProperty("user_originalValue", idx);
+
+        savesConverted = true;
+    }
 }
