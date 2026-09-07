@@ -69,6 +69,9 @@ void EmuInstance::audioInit()
         SDL_PauseAudioDevice(audioDevice, 1);
     }
 
+    audioRamp.Reset();
+    audioTailRequested.store(false, std::memory_order_relaxed);
+    audioTailSpent.store(false, std::memory_order_relaxed);
     audioUpdateSpeedUpSettings();
     audioLowPass.Init(audioFreq);
     audioTimeStretch.Reset();
@@ -344,6 +347,11 @@ void EmuInstance::audioArmHandoverFade()
 
 void EmuInstance::audioFinishBuffer(s16* stream, int len, int num_in)
 {
+    // the stream is being taken down: play the tail in place of the source,
+    // which was still read so the ring drains
+    bool tailRequested = audioTailRequested.load(std::memory_order_acquire);
+    if (tailRequested) num_in = 0;
+
     if (audioMutedByWindowFocus || audioMutedToggle || audioMutedByFastForward)
     {
         memset(stream, 0, len*sizeof(s16)*2);
@@ -351,35 +359,40 @@ void EmuInstance::audioFinishBuffer(s16* stream, int len, int num_in)
         // keep the cutoff smoother moving while muted, or re-engaging clicks.
         // with MuteFastForward on, this path is the fast-forward case.
         audioLowPass.ProcessMuted(len, audioLowPassCutoff(), len / (double)audioFreq);
+        // the ramp's history follows the silence, so a pause while muted has
+        // no tail to play
+        audioRamp.Track(stream, len);
+        if (tailRequested && audioRamp.TailSpent()) audioTailSpent.store(true, std::memory_order_release);
+        // follow the handover edge without arming a fade: silence needs none,
+        // and an unmute next to one would otherwise fade from a zeroed level
+        audioFadePrevEngaged = audioStretchEngaged;
         return;
     }
 
-    if (num_in < 1)
-    {
-        if (!audioStretchEngaged)
-        {
-            memset(stream, 0, len*sizeof(s16)*2);
-            audioLastFrame = 0;
-            return;
-        }
-
-        // fade the last frame out across this buffer. cutting straight to
-        // silence reads as a dropout, holding it sits on a DC offset.
-        s16 l = (s16)(audioLastFrame & 0xFFFF);
-        s16 r = (s16)(audioLastFrame >> 16);
-        for (int i = 0; i < len; i++)
-        {
-            int gain = ((len - i) << 8) / len;
-            stream[(i*2)+0] = (s16)(((s32)l * gain) >> 8);
-            stream[(i*2)+1] = (s16)(((s32)r * gain) >> 8);
-        }
-    }
-    else if (num_in < len)
+    // slow-mo with the stretcher off is untreated by design: pad the buffer by
+    // holding the last frame, as it always was
+    if (num_in >= 1 && num_in < len && !audioStretchEngaged && audioIsOffSpeed(curFPS, targetFPS))
     {
         int last = num_in-1;
 
         for (int i = num_in; i < len; i++)
             ((u32*)stream)[i] = ((u32*)stream)[last];
+        num_in = len;
+    }
+
+    // frames came back after the stream ended: bring them in on the ramp
+    if (num_in >= 1 && audioRamp.Ended()) audioRamp.Begin();
+    audioRamp.Track(stream, num_in);
+
+    if (num_in < len)
+    {
+        // the source ran out, or the stream is being taken down: end it on a
+        // tail from where it stopped rather than a step. the low-pass below
+        // runs over the tail too, so its state stays in step with what plays.
+        if (!audioRamp.Ended()) audioRamp.End();
+        audioRamp.FillTail(stream + (num_in * 2), len - num_in);
+        if (tailRequested && audioRamp.TailSpent())
+            audioTailSpent.store(true, std::memory_order_release);
     }
 
     audioLowPass.Process((int16_t*) stream, len, audioLowPassCutoff(),
@@ -764,6 +777,11 @@ void EmuInstance::audioEnable()
     // through here at all - see audioMarkDiscontinuity. Reset clears state the
     // audio thread owns, so hold the device lock.
     if (audioDevice) SDL_LockAudioDevice(audioDevice);
+    // the stream is coming back: ramp its first frames in. the ramp's own
+    // state is not reset, a tail's mute still applies to what comes back.
+    audioTailRequested.store(false, std::memory_order_relaxed);
+    audioTailSpent.store(false, std::memory_order_relaxed);
+    audioRamp.Begin();
     audioTimeStretch.Reset();
     audioStretchEngaged = false;
     audioLastFrame = 0;
@@ -787,8 +805,27 @@ void EmuInstance::audioEnable()
     if (micStarted) micOpen();
 }
 
+// emu thread. end the stream on its tail: the callback plays it in place of
+// the source from the next buffer on. the tail is two callbacks long, so wait
+// for the callback to report it spent, bounded so a device that has stopped
+// calling back cannot hold the emu thread. false if the stream was not up.
+bool EmuInstance::audioStreamEnd()
+{
+    if (!audioDevice || SDL_GetAudioDeviceStatus(audioDevice) != SDL_AUDIO_PLAYING) return false;
+    if (audioTailRequested.load(std::memory_order_acquire)) return false;
+
+    audioTailSpent.store(false, std::memory_order_relaxed);
+    audioTailRequested.store(true, std::memory_order_release);
+    int waitMs = (4 * 1000 * audioBufSize) / audioFreq + 1;
+    for (int i = 0; i < waitMs && !audioTailSpent.load(std::memory_order_acquire); i++)
+        SDL_Delay(1);
+    return true;
+}
+
 void EmuInstance::audioDisable()
 {
+    audioStreamEnd();
+
     if (audioDevice) SDL_PauseAudioDevice(audioDevice, 1);
     if (micStarted) micClose();
 }

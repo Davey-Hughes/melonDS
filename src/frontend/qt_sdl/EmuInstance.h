@@ -33,6 +33,7 @@
 #include "AudioSpeed.h"
 #include "AudioLowPass.h"
 #include "AudioTimeStretch.h"
+#include "AudioStreamRamp.h"
 
 const int kMaxWindows = 4;
 
@@ -258,6 +259,7 @@ private:
     void audioUpdateSettings();
     void audioUpdateSpeedUpSettings();
     void audioUpdateOutputSkew();
+    bool audioStreamEnd();
 
     void micOpen();
     void micClose();
@@ -388,6 +390,12 @@ private:
     bool audioMutedByWindowFocus;
     SDL_cond* audioSyncCond;
     SDL_mutex* audioSyncLock;
+    // conceals the ends of the stream. the emu thread asks for the tail
+    // through audioTailRequested and waits on audioTailSpent before pausing
+    // the device; everything else is the audio thread's.
+    AudioStreamRamp audioRamp;
+    std::atomic<bool> audioTailRequested{false};
+    std::atomic<bool> audioTailSpent{false};
 
     int mpAudioMode;
 
