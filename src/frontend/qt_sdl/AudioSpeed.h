@@ -25,8 +25,10 @@
 // the DS's true framerate; a skew of 1.0 emits at the hardware's rate
 constexpr double INTERNAL_FRAME_RATE = 59.8260982880808;
 
-// sentinel value: don't filter at all
-constexpr int kSpeedUpLowPassOff = 24000;
+// sentinel value: don't filter at all. the reference is divided by speed, so
+// the top of the range bounds how gentle the filter can be; well past any
+// device's Nyquist on purpose.
+constexpr int kSpeedUpLowPassOff = 48000;
 
 constexpr double kStretchTrimGain = 0.25;
 
@@ -87,7 +89,8 @@ inline double audioComputeLowPassCutoff(double curFPS, double targetFPS,
 
     double speed = audioSpeedRatio(curFPS, targetFPS);
     if (speed <= 1.0) return wideOpen;
-    if (reference >= kSpeedUpLowPassOff) return wideOpen;
+    // zero is off too, rather than clamping to the strongest filter
+    if (reference <= 0 || reference >= kSpeedUpLowPassOff) return wideOpen;
 
     return std::clamp(reference / speed, 200.0, wideOpen);
 }

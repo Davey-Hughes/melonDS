@@ -129,7 +129,7 @@
       <item row="1" column="1">
        <widget class="QSpinBox" name="spinSpeedUpLowPass">
         <property name="toolTip">
-         <string>Cutoff for fast-forward audio only. Use the highest value that still sounds good sped up; 24000 Hz is the same as unchecking the box.</string>
+         <string>Cutoff for fast-forward audio only, divided by the emulation speed. Use the highest value that still sounds good sped up; 48000 Hz is the same as unchecking the box.</string>
         </property>
         <property name="suffix">
          <string> Hz</string>
@@ -138,13 +138,13 @@
          <number>1000</number>
         </property>
         <property name="maximum">
-         <number>24000</number>
+         <number>48000</number>
         </property>
         <property name="singleStep">
          <number>500</number>
         </property>
         <property name="value">
-         <number>24000</number>
+         <number>48000</number>
         </property>
        </widget>
       </item>
