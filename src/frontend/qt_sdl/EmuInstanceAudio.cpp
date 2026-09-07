@@ -81,6 +81,9 @@ void EmuInstance::audioInit()
     audioMeasuredFPS.store(0.0, std::memory_order_relaxed);
     audioSampleFrac = 0.0;
     audioDrainEngaged = false;
+    audioFadePrevEngaged = false;
+    audioFadeOutFrames = 0;
+    audioFadeOutFrom[0] = audioFadeOutFrom[1] = 0.0f;
 
     micStarted = false;
     micDevice = 0;
@@ -325,6 +328,20 @@ double EmuInstance::audioLowPassCutoff() const
     return audioComputeLowPassCutoff(fps, targetFPS, ref, audioLowPass.WideOpenCutoff());
 }
 
+// switching between the stretcher and the raw FIFO jumps the output by the
+// stretcher's reserve in one direction or the other. the two sides cannot be
+// joined seamlessly, and a short equal-power cross-fade from the level the
+// stream stopped at is less audible than a splice.
+void EmuInstance::audioArmHandoverFade()
+{
+    // not while one is running: the edge can arrive twice in quick succession
+    if (audioFadeOutFrames != 0) return;
+
+    audioFadeOutFrames = kAudioHandoverFadeFrames;
+    audioFadeOutFrom[0] = (s16)(audioLastFrame & 0xFFFF) / 32768.0f;
+    audioFadeOutFrom[1] = (s16)(audioLastFrame >> 16) / 32768.0f;
+}
+
 void EmuInstance::audioFinishBuffer(s16* stream, int len, int num_in)
 {
     if (audioMutedByWindowFocus || audioMutedToggle || audioMutedByFastForward)
@@ -368,7 +385,38 @@ void EmuInstance::audioFinishBuffer(s16* stream, int len, int num_in)
     audioLowPass.Process((int16_t*) stream, len, audioLowPassCutoff(),
                          len / (double)audioFreq);
 
-    // pre-volume, so the fade path above can be re-scaled consistently
+    // either edge of the handover, seen on the buffer that first crosses it
+    if (audioStretchEngaged != audioFadePrevEngaged)
+    {
+        audioFadePrevEngaged = audioStretchEngaged;
+        audioArmHandoverFade();
+    }
+
+    if (audioFadeOutFrames > 0)
+    {
+        // smoothstep the progress so the gain leaves and arrives with zero
+        // slope; a step in rate of change is heard as a blip at each end
+        int n = std::min<int>(audioFadeOutFrames, len);
+        for (int j = 0; j < n; j++)
+        {
+            unsigned done = kAudioHandoverFadeFrames - audioFadeOutFrames + j + 1;
+            float u = (float)done / kAudioHandoverFadeFrames;
+            float th = 0.5f * (float)M_PI * (u * u * (3.0f - 2.0f * u));
+            float g = std::cos(th);
+            float gn = std::sin(th);
+            float env = 1.0f - ((1.0f - kAudioHandoverDipDepth)
+                                * std::sin((float)M_PI * done / kAudioHandoverFadeFrames));
+            for (int ch = 0; ch < 2; ch++)
+            {
+                float v = ((audioFadeOutFrom[ch] * g) + ((stream[(j*2)+ch] / 32768.0f) * gn)) * env;
+                stream[(j*2)+ch] = (s16)std::clamp(std::lround(v * 32768.0f), -32768L, 32767L);
+            }
+        }
+        audioFadeOutFrames -= n;
+    }
+
+    // pre-volume: what continues from this frame is scaled once, by the
+    // volume below
     if (len > 0) audioLastFrame = ((u32*)stream)[len-1];
 
     if (audioVolume < 256)
@@ -725,6 +773,9 @@ void EmuInstance::audioEnable()
     audioOfferedFrames.store(0, std::memory_order_relaxed);
     audioSampleFrac = 0.0;
     audioDrainEngaged = false;
+    audioFadePrevEngaged = false;
+    audioFadeOutFrames = 0;
+    audioFadeOutFrom[0] = audioFadeOutFrom[1] = 0.0f;
     if (audioDevice) SDL_UnlockAudioDevice(audioDevice);
 
     // the skew depends only on targetFPS, so it doesn't belong in the audio

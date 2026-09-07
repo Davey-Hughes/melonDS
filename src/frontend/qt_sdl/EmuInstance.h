@@ -42,6 +42,13 @@ const int kMaxWindows = 4;
 // lowering that floor means raising this too.
 const int kAudioDrainMax = 2048;
 
+// cross-fade across a stretcher handover, in output frames. kept short: both
+// sides are the same material at different points, so a long overlap is heard
+// for itself. the dip at the midpoint attenuates the discontinuity the
+// handover carries, at the cost of a shallow notch.
+const unsigned kAudioHandoverFadeFrames = 256;
+const float kAudioHandoverDipDepth = 0.15f;
+
 enum
 {
     HK_Lid = 0,
@@ -262,6 +269,7 @@ private:
     static void audioCallback(void* data, Uint8* stream, int len);
     void audioDirectRead(melonDS::s16* stream, int len);
     void audioStretchedRead(melonDS::s16* stream, int len);
+    void audioArmHandoverFade();
     void audioFinishBuffer(melonDS::s16* stream, int len, int num_in);
 
     int micGetNumSamplesIn(int inlen);
@@ -369,6 +377,12 @@ private:
     double audioSampleFrac;
     melonDS::s16 audioDrainTemp[kAudioDrainMax * 2];
     bool audioDrainEngaged;
+    // audio thread. audioStretchEngaged as of the last buffer, so the
+    // handover is seen as an edge; the cross-fade still to run, and the
+    // level it started from
+    bool audioFadePrevEngaged;
+    unsigned audioFadeOutFrames;
+    float audioFadeOutFrom[2];
     bool audioMutedToggle;
     bool audioMutedByFastForward;
     bool audioMutedByWindowFocus;
