@@ -543,6 +543,8 @@ void EmuThread::handleMessages()
             break;
 
         case msg_EmuReset:
+            // audioEnable below brings the stream back
+            emuInstance->audioJumpBegin();
             emuInstance->reset();
 
             emuStatus = emuStatus_Running;
@@ -625,13 +627,21 @@ void EmuThread::handleMessages()
             break;
 
         case msg_LoadState:
-            msgResult = emuInstance->loadState(msg.param.value<QString>().toStdString());
-            emuInstance->audioMarkDiscontinuity();
+            {
+                bool ramped = emuInstance->audioJumpBegin();
+                msgResult = emuInstance->loadState(msg.param.value<QString>().toStdString());
+                emuInstance->audioMarkDiscontinuity();
+                emuInstance->audioJumpEnd(ramped);
+            }
             break;
 
         case msg_UndoStateLoad:
-            emuInstance->undoStateLoad();
-            emuInstance->audioMarkDiscontinuity();
+            {
+                bool ramped = emuInstance->audioJumpBegin();
+                emuInstance->undoStateLoad();
+                emuInstance->audioMarkDiscontinuity();
+                emuInstance->audioJumpEnd(ramped);
+            }
             msgResult = 1;
             break;
 

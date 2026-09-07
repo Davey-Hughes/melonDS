@@ -201,6 +201,40 @@ void EmuInstance::audioMarkDiscontinuity()
     audioTimeStretch.BeginSession();
 }
 
+bool EmuInstance::audioJumpBegin()
+{
+    return audioStreamEnd();
+}
+
+void EmuInstance::audioJumpEnd(bool ramped)
+{
+    // the SPU output ring is not part of a savestate, so it still holds
+    // audio from before the jump; that would come back spliced behind the
+    // tail, or behind the resume ramp if the jump was made while paused.
+    // bounded: the ring is finite and nothing feeds it here.
+    if (nds != nullptr)
+    {
+        SDL_LockMutex(audioSyncLock);
+        for (int i = 0; i < 8 && nds->SPU.GetOutputSize() > 0; i++)
+            nds->SPU.ReadOutput(audioDrainTemp, kAudioDrainMax);
+        SDL_UnlockMutex(audioSyncLock);
+    }
+
+    if (!ramped) return;
+
+    // the device kept running through the jump, so the ramp is armed under
+    // its lock rather than with it paused
+    if (audioDevice) SDL_LockAudioDevice(audioDevice);
+    audioTailRequested.store(false, std::memory_order_relaxed);
+    audioTailSpent.store(false, std::memory_order_relaxed);
+    audioRamp.Begin();
+    // a cross-fade still running would re-inject the pre-jump level on top of
+    // the frames the ramp is bringing back
+    audioFadeOutFrames = 0;
+    audioFadeOutFrom[0] = audioFadeOutFrom[1] = 0.0f;
+    if (audioDevice) SDL_UnlockAudioDevice(audioDevice);
+}
+
 void EmuInstance::audioSetMeasuredFPS(double fps)
 {
     audioMeasuredFPS.store(fps, std::memory_order_relaxed);

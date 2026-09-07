@@ -192,6 +192,12 @@ public:
     bool audioOffSpeed() const;
     // emu thread. call when the stream jumps - savestate load, undo
     void audioMarkDiscontinuity();
+    // emu thread. bracket a jump in the game's state - a load, an undo, a
+    // reset - with the pause tail and the resume ramp, so the splice lands in
+    // silence. a stream already down is left alone: begin returns false and
+    // end then does nothing.
+    bool audioJumpBegin();
+    void audioJumpEnd(bool ramped);
     // emu thread. the achieved frame rate, for the low-pass only
     void audioSetMeasuredFPS(double fps);
 
