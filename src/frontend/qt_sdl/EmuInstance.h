@@ -362,6 +362,9 @@ private:
     bool audioStretchEngaged;
     melonDS::u32 audioLastFrame;
     double audioArrivalAvg;
+    // speed the last fast-forward hold actually reached, banked at release
+    // and seeding the next engage; 0 until one has happened
+    double audioSpeedAchieved;
     melonDS::s64 audioLastOffered;
     double audioSampleFrac;
     melonDS::s16 audioDrainTemp[kAudioDrainMax * 2];

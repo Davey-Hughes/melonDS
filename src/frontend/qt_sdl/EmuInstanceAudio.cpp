@@ -75,6 +75,7 @@ void EmuInstance::audioInit()
     audioStretchEngaged = false;
     audioLastFrame = 0;
     audioArrivalAvg = 0.0;
+    audioSpeedAchieved = 0.0;
     audioLastOffered = 0;
     audioOfferedFrames.store(0, std::memory_order_relaxed);
     audioMeasuredFPS.store(0.0, std::memory_order_relaxed);
@@ -220,6 +221,14 @@ void EmuInstance::audioCallback(void* data, Uint8* stream, int len)
 
     if (!inst->audioOffSpeed())
     {
+        // bank the speed the hold reached before the average is thrown away
+        if (inst->audioStretchEngaged && len > 0)
+        {
+            double reached = inst->audioArrivalAvg / len;
+            if (std::isfinite(reached) && reached > 1.05)
+                inst->audioSpeedAchieved = reached;
+        }
+
         // no Reset() here: this is the audio thread, and the emu thread can
         // still be inside Write. re-engaging resyncs via BeginSession anyway.
         inst->audioStretchEngaged = false;
@@ -230,7 +239,21 @@ void EmuInstance::audioCallback(void* data, Uint8* stream, int len)
     if (!inst->audioStretchEngaged)
     {
         inst->audioStretchEngaged = true;
-        inst->audioArrivalAvg = len * audioSpeedRatio(inst->curFPS, inst->targetFPS);
+
+        // the requested speed is a ceiling the host may not reach, and the
+        // average takes most of a short hold to walk down from it. seed from
+        // what the last hold actually reached instead, capped by the request
+        // only where something enforces it: curFPS is 1000 for uncapped
+        // fast-forward, and nothing paces the loop with the limiter off.
+        double requested = audioSpeedRatio(inst->curFPS, inst->targetFPS);
+        double anchor = requested;
+        if (requested > 1.05 && inst->audioSpeedAchieved > 1.05)
+        {
+            anchor = inst->audioSpeedAchieved;
+            if (inst->doLimitFPS && inst->curFPS < 999.0 && anchor > requested)
+                anchor = requested;
+        }
+        inst->audioArrivalAvg = len * anchor;
     }
     inst->audioStretchedRead((s16*) stream, len);
 }
@@ -697,6 +720,7 @@ void EmuInstance::audioEnable()
     audioStretchEngaged = false;
     audioLastFrame = 0;
     audioArrivalAvg = 0.0;
+    audioSpeedAchieved = 0.0;
     audioLastOffered = 0;
     audioOfferedFrames.store(0, std::memory_order_relaxed);
     audioSampleFrac = 0.0;
