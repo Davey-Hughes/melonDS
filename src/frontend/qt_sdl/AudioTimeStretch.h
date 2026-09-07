@@ -162,8 +162,14 @@ public:
             Primed = false;
         }
 
+        // overlap-add only reaches full amplitude once the accumulator carries a
+        // whole window, so the first hop after a reposition would ramp up from
+        // silence. charge the accumulator with one hop and drop its output.
+        if (!Primed && CanSynthesise())
+            SynthesiseHop(ratio, false);
+
         while ((OutputFill() < numFrames) && CanSynthesise())
-            SynthesiseHop(ratio);
+            SynthesiseHop(ratio, true);
 
         int n = std::min(numFrames, OutputFill());
         for (int i = 0; i < n; i++)
@@ -222,7 +228,9 @@ private:
         return (SeenWrite >= frameEnd) && (SeenWrite >= naturalEnd);
     }
 
-    void SynthesiseHop(double ratio)
+    // output=false charges the accumulator and advances without writing out.
+    // not named emit: Qt defines that away.
+    void SynthesiseHop(double ratio, bool output)
     {
         int hop = (int)std::lround(kSynthesisHop * ratio);
         if (hop < 1) hop = 1;
@@ -238,12 +246,15 @@ private:
             AccR[i] += w * (float)InR[idx];
         }
 
-        for (int i = 0; i < kSynthesisHop; i++)
+        if (output)
         {
-            int idx = (int)(OutWritePos & (kOutputCapacity - 1));
-            OutL[idx] = Saturate(AccL[i]);
-            OutR[idx] = Saturate(AccR[i]);
-            OutWritePos++;
+            for (int i = 0; i < kSynthesisHop; i++)
+            {
+                int idx = (int)(OutWritePos & (kOutputCapacity - 1));
+                OutL[idx] = Saturate(AccL[i]);
+                OutR[idx] = Saturate(AccR[i]);
+                OutWritePos++;
+            }
         }
 
         std::memmove(AccL, AccL + kSynthesisHop, kSynthesisHop * sizeof(float));
