@@ -51,14 +51,22 @@ public:
     double Cutoff() const { return CurCutoff; }
     bool Bypassed() const { return CurCutoff >= (WideOpen * kBypassThreshold); }
 
-    // advance the smoothed cutoff by one block, then filter in place
+    // advance the smoothed cutoff by one block, then filter in place.
+    // the coefficients are interpolated across the block rather than replaced
+    // in one go: a transposed direct-form biquad's state encodes its past under
+    // the coefficients that produced it, so a step leaves the two inconsistent
+    // and the filter rings, once per block.
     void Process(int16_t* samples, int numFrames, double targetHz, double blockSeconds)
     {
-        Smooth(targetHz, blockSeconds);
+        if (numFrames < 1) return;
+
+        double from[2][5], to[2][5];
+        BeginBlock(targetHz, blockSeconds, from, to);
         bool bypass = Bypassed();
 
         for (int i = 0; i < numFrames; i++)
         {
+            StepCoefficients(from, to, (double)(i + 1) / numFrames);
             for (int ch = 0; ch < 2; ch++)
             {
                 // runs even when bypassed: the state must stay in step with
@@ -67,6 +75,8 @@ public:
                 if (!bypass) samples[(i*2)+ch] = Saturate(y);
             }
         }
+
+        EndBlock(to);
     }
 
     // advance the cutoff and the filter state over silence, writing nothing.
@@ -74,10 +84,19 @@ public:
     // whatever was still ringing in the biquads into a buffer meant to be quiet.
     void ProcessMuted(int numFrames, double targetHz, double blockSeconds)
     {
-        Smooth(targetHz, blockSeconds);
+        if (numFrames < 1) return;
+
+        double from[2][5], to[2][5];
+        BeginBlock(targetHz, blockSeconds, from, to);
+
         for (int i = 0; i < numFrames; i++)
+        {
+            StepCoefficients(from, to, (double)(i + 1) / numFrames);
             for (int ch = 0; ch < 2; ch++)
                 ProcessSample(0.0, ch);
+        }
+
+        EndBlock(to);
     }
 
     void Smooth(double targetHz, double blockSeconds)
@@ -111,11 +130,50 @@ private:
         return (int16_t)v;
     }
 
+    // coefficients as they stand, then as designed for this block's cutoff
+    void BeginBlock(double targetHz, double blockSeconds, double from[2][5], double to[2][5])
+    {
+        for (int s = 0; s < 2; s++) Stages[s].Snapshot(from[s]);
+        Smooth(targetHz, blockSeconds);
+        for (int s = 0; s < 2; s++) Stages[s].Snapshot(to[s]);
+    }
+
+    void StepCoefficients(const double from[2][5], const double to[2][5], double t)
+    {
+        for (int s = 0; s < 2; s++) Stages[s].Lerp(from[s], to[s], t);
+    }
+
+    // land exactly on the designed set, so rounding in the interpolation
+    // cannot accumulate across blocks
+    void EndBlock(const double to[2][5])
+    {
+        for (int s = 0; s < 2; s++) Stages[s].Restore(to[s]);
+    }
+
     struct Biquad
     {
         double b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;
         double z1[2] = {0.0, 0.0};
         double z2[2] = {0.0, 0.0};
+
+        void Snapshot(double out[5]) const
+        {
+            out[0] = b0; out[1] = b1; out[2] = b2; out[3] = a1; out[4] = a2;
+        }
+
+        void Restore(const double in[5])
+        {
+            b0 = in[0]; b1 = in[1]; b2 = in[2]; a1 = in[3]; a2 = in[4];
+        }
+
+        void Lerp(const double from[5], const double to[5], double t)
+        {
+            b0 = from[0] + ((to[0] - from[0]) * t);
+            b1 = from[1] + ((to[1] - from[1]) * t);
+            b2 = from[2] + ((to[2] - from[2]) * t);
+            a1 = from[3] + ((to[3] - from[3]) * t);
+            a2 = from[4] + ((to[4] - from[4]) * t);
+        }
 
         void Design(double cutoffHz, double sampleRate, double q)
         {
