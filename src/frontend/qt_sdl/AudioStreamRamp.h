@@ -237,11 +237,22 @@ private:
         LastOut[1] = r;
     }
 
+    int HistIdx(int age) const
+    {
+        return (HistPos + kHistFrames - age) % kHistFrames;
+    }
+
     // the frame 'age' frames back from the most recently played one; age 1 is
     // that frame itself. the caller checks age against HistFill.
     const float* HistAt(int age) const
     {
-        return Hist[(HistPos + kHistFrames - age) % kHistFrames];
+        return Hist[HistIdx(age)];
+    }
+
+    // one frame older, wrapping without a modulo
+    static int HistPrev(int idx)
+    {
+        return idx ? (idx - 1) : (kHistFrames - 1);
     }
 
     // the lag whose copy of the last kCorrFrames frames matches them best.
@@ -255,13 +266,18 @@ private:
         if (HistFill < kMinPeriod + kCorrFrames) return 0;
         int maxP = std::min(kMaxPeriod, HistFill - kCorrFrames);
 
-        // the energy only decides whether there is anything here worth matching
+        // the reference window is the same for every candidate, so sum its
+        // channels once. the energy only decides whether there is anything
+        // here worth matching
+        float ref[kCorrFrames];
         float eRef = 0.0f;
+        int ia = HistIdx(1);
         for (int k = 0; k < kCorrFrames; k++)
         {
-            const float* f = HistAt(1 + k);
-            float v = f[0] + f[1];
-            eRef += v * v;
+            const float* f = Hist[ia];
+            ref[k] = f[0] + f[1];
+            eRef += ref[k] * ref[k];
+            ia = HistPrev(ia);
         }
         if (eRef <= 0.0f) return 0;
 
@@ -270,12 +286,13 @@ private:
         for (int p = kMinPeriod; p <= maxP; p++)
         {
             float diff = 0.0f;
+            int ib = HistIdx(1 + p);
             for (int k = 0; k < kCorrFrames; k++)
             {
-                const float* a = HistAt(1 + k);
-                const float* b = HistAt(1 + p + k);
-                float d = (a[0] + a[1]) - (b[0] + b[1]);
+                const float* b = Hist[ib];
+                float d = ref[k] - (b[0] + b[1]);
                 diff += d * d;
+                ib = HistPrev(ib);
             }
             if (bestDiff < 0.0f || diff < bestDiff)
             {
