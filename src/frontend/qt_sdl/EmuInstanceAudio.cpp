@@ -242,7 +242,9 @@ void EmuInstance::audioSetMeasuredFPS(double fps)
 
 void EmuInstance::audioSync()
 {
-    if (audioDevice)
+    // a paused device drains nothing, and neither the callback nor audioDrainSPU
+    // can signal from there, so the wait would only spend its timeout
+    if (audioDevice && SDL_GetAudioDeviceStatus(audioDevice) == SDL_AUDIO_PLAYING)
     {
         SDL_LockMutex(audioSyncLock);
         while (nds->SPU.GetOutputSize() >= audioBufSize)
