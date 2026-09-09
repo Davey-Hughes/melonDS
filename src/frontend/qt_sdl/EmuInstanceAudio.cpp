@@ -206,19 +206,23 @@ bool EmuInstance::audioJumpBegin()
     return audioStreamEnd();
 }
 
+// emu thread. bounded: the ring is finite and nothing feeds it here.
+void EmuInstance::audioDrainRing()
+{
+    if (nds == nullptr) return;
+
+    SDL_LockMutex(audioSyncLock);
+    for (int i = 0; i < 8 && nds->SPU.GetOutputSize() > 0; i++)
+        nds->SPU.ReadOutput(audioDrainTemp, kAudioDrainMax);
+    SDL_UnlockMutex(audioSyncLock);
+}
+
 void EmuInstance::audioJumpEnd(bool ramped)
 {
     // the SPU output ring is not part of a savestate, so it still holds
     // audio from before the jump; that would come back spliced behind the
     // tail, or behind the resume ramp if the jump was made while paused.
-    // bounded: the ring is finite and nothing feeds it here.
-    if (nds != nullptr)
-    {
-        SDL_LockMutex(audioSyncLock);
-        for (int i = 0; i < 8 && nds->SPU.GetOutputSize() > 0; i++)
-            nds->SPU.ReadOutput(audioDrainTemp, kAudioDrainMax);
-        SDL_UnlockMutex(audioSyncLock);
-    }
+    audioDrainRing();
 
     if (!ramped) return;
 
@@ -808,6 +812,11 @@ void EmuInstance::audioUpdateOutputSkew()
 
 void EmuInstance::audioEnable()
 {
+    // whatever the ring still holds was never played: the tail replaced it
+    // while the stream went down. a frame step is the loud case - it runs
+    // frames with the device paused, and they would all play at the resume.
+    audioDrainRing();
+
     // covers emulator reset, which brackets with audioDisable/audioEnable,
     // else pre-reset audio splices into post. savestate load does not come
     // through here at all - see audioMarkDiscontinuity. Reset clears state the

@@ -266,6 +266,7 @@ private:
     void audioUpdateSpeedUpSettings();
     void audioUpdateOutputSkew();
     bool audioStreamEnd();
+    void audioDrainRing();
 
     void micOpen();
     void micClose();
