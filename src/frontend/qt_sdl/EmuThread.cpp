@@ -574,8 +574,15 @@ void EmuThread::handleMessages()
 
         case msg_BootROM:
             msgResult = 0;
+            // the console is rebuilt under a callback that dereferences nds,
+            // so stop the device rather than only ending the stream. msg_EmuRun
+            // brings it back; a failed boot leaves the old one running instead
+            emuInstance->audioDisable();
             if (!emuInstance->loadROM(msg.param.value<QStringList>(), true, msgError))
+            {
+                if (emuStatus == emuStatus_Running) emuInstance->audioEnable();
                 break;
+            }
 
             assert(emuInstance->nds != nullptr);
             emuInstance->nds->Start();
@@ -584,8 +591,12 @@ void EmuThread::handleMessages()
 
         case msg_BootFirmware:
             msgResult = 0;
+            emuInstance->audioDisable();
             if (!emuInstance->bootToMenu(msgError))
+            {
+                if (emuStatus == emuStatus_Running) emuInstance->audioEnable();
                 break;
+            }
 
             assert(emuInstance->nds != nullptr);
             emuInstance->nds->Start();
