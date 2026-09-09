@@ -276,7 +276,17 @@ private:
         // the reference would then be overwritten frames, so don't search.
         if (NaturalPos < oldest) return AnalysisPos;
 
-        double refEnergy = Energy(NaturalPos);
+        // NaturalPos is fixed for the whole search: copy the reference window
+        // out once rather than paying the masked load per candidate, and take
+        // its energy in the same pass
+        double ref[kSynthesisHop];
+        double refEnergy = 0.0;
+        for (int i = 0; i < kSynthesisHop; i++)
+        {
+            double v = InMono[(int)((NaturalPos + i) & (kInputCapacity - 1))];
+            ref[i] = v;
+            refEnergy += v * v;
+        }
 
         // full radius regardless of hop: expansion needs the reach
         const int radius = kSearchRadius;
@@ -296,11 +306,11 @@ private:
         // seeded from the nominal offset, so ties keep it rather than sliding
         // to the bottom of the window (every score is 0 on digital silence)
         int bestK = std::min(std::max(lowestK, 0), highestK);
-        double bestScore = Score(AnalysisPos + bestK, refEnergy);
+        double bestScore = Score(AnalysisPos + bestK, ref, refEnergy);
 
         for (int k = lowestK; k <= highestK; k += kCoarseStride)
         {
-            double s = Score(AnalysisPos + k, refEnergy);
+            double s = Score(AnalysisPos + k, ref, refEnergy);
             if (s > bestScore) { bestScore = s; bestK = k; }
         }
 
@@ -308,34 +318,24 @@ private:
         int hi = std::min(highestK, bestK + kFineRadius);
         for (int k = lo; k <= hi; k++)
         {
-            double s = Score(AnalysisPos + k, refEnergy);
+            double s = Score(AnalysisPos + k, ref, refEnergy);
             if (s > bestScore) { bestScore = s; bestK = k; }
         }
 
         return AnalysisPos + bestK;
     }
 
-    double Energy(int64_t pos) const
-    {
-        double e = 0.0;
-        for (int i = 0; i < kSynthesisHop; i++)
-        {
-            double v = InMono[(int)((pos + i) & (kInputCapacity - 1))];
-            e += v * v;
-        }
-        return e;
-    }
 
-    // normalised, so the search doesn't just latch onto the loudest candidate
-    double Score(int64_t pos, double refEnergy) const
+    // normalised, so the search doesn't just latch onto the loudest candidate.
+    // ref is the natural-continuation window as a linear copy
+    double Score(int64_t pos, const double* ref, double refEnergy) const
     {
         double dot = 0.0;
         double energy = 0.0;
         for (int i = 0; i < kSynthesisHop; i++)
         {
             double a = InMono[(int)((pos + i) & (kInputCapacity - 1))];
-            double b = InMono[(int)((NaturalPos + i) & (kInputCapacity - 1))];
-            dot += a * b;
+            dot += a * ref[i];
             energy += a * a;
         }
         return dot / std::sqrt((energy * refEnergy) + 1.0e-9);
