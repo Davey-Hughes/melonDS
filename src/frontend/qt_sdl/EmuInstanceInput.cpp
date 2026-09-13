@@ -368,6 +368,7 @@ bool EmuInstance::handlePokeTypeKey(QKeyEvent* event)
     if (pokeTypeBindings.releaseKeyBound() && keyChord == pokeTypeBindings.releaseKey)
     {
         pokeTypeGrabbed = !pokeTypeGrabbed;
+        if (!pokeTypeGrabbed) pokeTypeReleaseDpad(pokeTypeDpadHeld);
         osdAddMessage(0, pokeTypeGrabbed ? "Typing keyboard: capturing"
                                          : "Typing keyboard: released");
         return true;
@@ -397,6 +398,16 @@ bool EmuInstance::handlePokeTypeKey(QKeyEvent* event)
     {
         pokeTypeQueueKey({pokeTypeCharFor(region, keyid, event), (melonDS::u8)keyid, mods, true});
         return true;
+    }
+
+    // The game's menus read only the D-pad, never keyboard arrow events. Opt-in,
+    // as it isn't known whether a real keyboard's arrows move them: an arrow
+    // binding also presses its D-pad bit, released in onKeyRelease.
+    int dpadBit = PokeTypeBindings::dpadBitForKeyID(keyid);
+    if (dpadBit >= 0 && localCfg.GetBool("PokeType.ArrowsToDpad"))
+    {
+        keyInputMask &= ~(1u << dpadBit);
+        pokeTypeDpadHeld |= (1u << dpadBit);
     }
 
     if (keyid != 0)
@@ -494,8 +505,40 @@ void EmuInstance::onKeyPress(QKeyEvent* event)
             keyHotkeyMask |= (1<<i);
 }
 
+void EmuInstance::pokeTypeDpadKeyReleased(QKeyEvent* event)
+{
+    if (!pokeTypeDpadHeld) return;
+
+    // cart gone with a key still down: nothing to resolve against, so release all
+    if (!pokeTypeKeyboardSupported())
+    {
+        pokeTypeReleaseDpad(pokeTypeDpadHeld);
+        return;
+    }
+
+    // Same resolution as the press: the bare key, in the loaded region.
+    int keyBare = getEventKeyVal(event);
+    if (event->modifiers() != Qt::KeypadModifier)
+        keyBare &= ~event->modifiers();
+
+    melonDS::u16 keyid = pokeTypeBindings.keyIDFor(pokeTypeCartRegion.load(), keyBare);
+    int dpadBit = PokeTypeBindings::dpadBitForKeyID(keyid);
+    if (dpadBit >= 0)
+        pokeTypeReleaseDpad(1u << dpadBit);
+}
+
+void EmuInstance::pokeTypeReleaseDpad(melonDS::u32 bits)
+{
+    bits &= pokeTypeDpadHeld;
+    keyInputMask |= bits;
+    pokeTypeDpadHeld &= ~bits;
+}
+
 void EmuInstance::onKeyRelease(QKeyEvent* event)
 {
+    // not gated on the grab or the setting: either may have changed since the press
+    pokeTypeDpadKeyReleased(event);
+
     int keyHK = getEventKeyVal(event);
     int keyKP = keyHK;
     if (event->modifiers() != Qt::KeypadModifier)
@@ -514,6 +557,7 @@ void EmuInstance::keyReleaseAll()
 {
     keyInputMask = 0xFFF;
     keyHotkeyMask = 0;
+    pokeTypeDpadHeld = 0;
 }
 
 bool EmuInstance::joystickButtonDown(int val)
