@@ -57,11 +57,6 @@ static const u8 LinkKey[16] =
 // An SDP response adds 14 bytes of L2CAP and SDP framing to its chunk: 57 - 14 = 43.
 static constexpr u32 MaxSDPChunk = 43;
 
-// Far beyond anything the link builds up, so only a corrupt savestate exceeds them
-static constexpr u32 MaxSavedChannels = 64;
-static constexpr u32 MaxSavedPackets = 1024;
-static constexpr u32 MaxSavedPacketSize = 1024;
-
 void BTKeyboard::Reset() noexcept
 {
     Outgoing.clear();
@@ -94,8 +89,11 @@ void BTKeyboard::DoSavestate(Savestate* file)
         Channels.resize(nchannels);
     }
 
-    for (auto& ch : Channels)
+    // every slot is written, used or not
+    for (u32 i = 0; i < MaxSavedChannels; i++)
     {
+        Channel spare {};
+        Channel& ch = (i < nchannels) ? Channels[i] : spare;
         file->Var16(&ch.LocalCID);
         file->Var16(&ch.RemoteCID);
         file->Var16(&ch.PSM);
@@ -120,32 +118,43 @@ void BTKeyboard::DoSavestate(Savestate* file)
     file->Var32(&PageAttempts);
     file->Var32(&HIDConnectAttempts);
 
+    // unread packets, each a u16 length and its bytes, packed into a fixed block
     u32 npending = (u32)Outgoing.size();
-    file->Var32(&npending);
+    u8 pending[SavedPacketBytes] {};
     if (file->Saving)
     {
+        u32 pos = 0;
         for (auto& pkt : Outgoing)
         {
-            u32 len = (u32)pkt.size();
-            file->Var32(&len);
-            if (len) file->VarArray(pkt.data(), len);
+            if (pkt.size() + 2 > SavedPacketBytes - pos)
+            {
+                file->Error = true;
+                return;
+            }
+
+            u16 len = (u16)pkt.size();
+            memcpy(&pending[pos], &len, 2);
+            memcpy(&pending[pos + 2], pkt.data(), len);
+            pos += 2 + len;
         }
     }
-    else
+
+    file->Var32(&npending);
+    file->VarArray(pending, sizeof(pending));
+    if (file->Saving) return;
+
+    Outgoing.clear();
+    u32 pos = 0;
+    for (u32 i = 0; i < npending; i++)
     {
-        Outgoing.clear();
-        if (npending > MaxSavedPackets) return RejectSavestate(file);
+        // every packet has at least its type byte
+        u16 len = 0;
+        if (SavedPacketBytes - pos >= 2) memcpy(&len, &pending[pos], 2);
+        if (len == 0 || len + 2u > SavedPacketBytes - pos) return RejectSavestate(file);
 
-        for (u32 i = 0; i < npending; i++)
-        {
-            u32 len = 0;
-            file->Var32(&len);
-            if (len > MaxSavedPacketSize) return RejectSavestate(file);
-
-            std::vector<u8> pkt(len);
-            if (len) file->VarArray(pkt.data(), len);
-            Outgoing.push_back(std::move(pkt));
-        }
+        const u8* data = pending + pos + 2;
+        Outgoing.emplace_back(data, data + len);
+        pos += 2 + len;
     }
 }
 
@@ -347,6 +356,9 @@ void BTKeyboard::OpenHIDChannels()
 
 void BTKeyboard::OpenChannel(u16 psm)
 {
+    // a savestate couldn't hold another
+    if (Channels.size() >= MaxSavedChannels) return;
+
     Channel ch;
     ch.LocalCID   = NextLocalCID++;
     ch.RemoteCID  = 0;              // filled in once the Connection Response arrives
@@ -1277,7 +1289,7 @@ void BTKeyboard::HandleL2CAP(u16 cid, const u8* data, u32 len)
             u16 psm  = (u16)(params[0] | (params[1] << 8));
             u16 scid = (u16)(params[2] | (params[3] << 8));
 
-            // a state with more channels than this couldn't be loaded back
+            // a savestate couldn't hold another
             if (Channels.size() >= MaxSavedChannels)
             {
                 u8 rsp[8];
